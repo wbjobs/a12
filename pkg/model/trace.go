@@ -41,7 +41,8 @@ const (
 	ProtocolHTTP    Protocol = 0
 	ProtocolGRPC    Protocol = 1
 	ProtocolRedis   Protocol = 2
-	ProtocolUnknown Protocol = 3
+	ProtocolEnvoy   Protocol = 3
+	ProtocolUnknown Protocol = 4
 )
 
 func (p Protocol) String() string {
@@ -52,6 +53,8 @@ func (p Protocol) String() string {
 		return "grpc"
 	case ProtocolRedis:
 		return "redis"
+	case ProtocolEnvoy:
+		return "envoy"
 	default:
 		return "unknown"
 	}

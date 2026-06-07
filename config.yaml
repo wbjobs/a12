@@ -34,3 +34,30 @@ protocols:
   redis:
     enabled: true
     ports: [6379]
+
+anomaly:
+  enabled: true
+  alpha: 0.2
+  deviation_threshold: 3.0
+  min_samples: 100
+  cooldown_seconds: 60
+  alertmanager:
+    enabled: false
+    url: "http://localhost:9093"
+    timeout_ms: 1000
+
+compression:
+  enabled: true
+  compression_level: 3
+  max_cache_size: 10000
+  similarity_threshold: 0.9
+
+flamegraph:
+  enabled: true
+  default_width: 1200
+  height_per_frame: 18
+  max_depth: 100
+
+envoy:
+  enabled: true
+  detect_all_ports: false

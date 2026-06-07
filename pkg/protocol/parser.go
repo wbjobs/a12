@@ -49,6 +49,7 @@ type ProtocolInfo struct {
 	HTTP   *HTTPRequest  `json:"http,omitempty"`
 	GRPC   *GRPCMessage `json:"grpc,omitempty"`
 	Redis  *RedisCommand `json:"redis,omitempty"`
+	Envoy  *EnvoyMessage `json:"envoy,omitempty"`
 	Raw     string       `json:"raw,omitempty"`
 }
 
@@ -56,6 +57,7 @@ type Parser struct {
 	httpParser  *HTTPParser
 	grpcParser  *GRPCParser
 	redisParser *RedisParser
+	envoyParser *EnvoyParser
 }
 
 func NewParser() *Parser {
@@ -63,6 +65,7 @@ func NewParser() *Parser {
 		httpParser:  NewHTTPParser(),
 		grpcParser:  NewGRPCParser(),
 		redisParser: NewRedisParser(),
+		envoyParser: NewEnvoyParser(),
 	}
 }
 
@@ -78,6 +81,16 @@ func (p *Parser) Parse(event *model.RawTraceEvent, span *model.Span) *ProtocolIn
 	}
 
 	info := &ProtocolInfo{}
+
+	if p.envoyParser.CanHandle(port, payload) {
+		if envoyMsg, err := p.envoyParser.Parse(payload, span); err == nil {
+			info.Envoy = envoyMsg
+			innerPayload := p.envoyParser.ExtractInnerPayload(payload)
+			if len(innerPayload) > 0 {
+				payload = innerPayload
+			}
+		}
+	}
 
 	switch model.Protocol(event.Protocol) {
 	case model.ProtocolHTTP:

@@ -8,11 +8,15 @@ import (
 )
 
 type Config struct {
-	Server     ServerConfig     `mapstructure:"server"`
-	ClickHouse ClickHouseConfig `mapstructure:"clickhouse"`
-	Sampling   SamplingConfig   `mapstructure:"sampling"`
-	EBPF       EBPFConfig       `mapstructure:"ebpf"`
-	Protocols  ProtocolsConfig  `mapstructure:"protocols"`
+	Server      ServerConfig       `mapstructure:"server"`
+	ClickHouse  ClickHouseConfig   `mapstructure:"clickhouse"`
+	Sampling    SamplingConfig     `mapstructure:"sampling"`
+	EBPF        EBPFConfig         `mapstructure:"ebpf"`
+	Protocols   ProtocolsConfig    `mapstructure:"protocols"`
+	Anomaly     AnomalyConfig      `mapstructure:"anomaly"`
+	Compression CompressionConfig  `mapstructure:"compression"`
+	FlameGraph  FlameGraphConfig   `mapstructure:"flamegraph"`
+	Envoy       EnvoyConfig        `mapstructure:"envoy"`
 }
 
 type ServerConfig struct {
@@ -80,4 +84,38 @@ func Load(configPath string) error {
 func (c *ClickHouseConfig) DSN() string {
 	return fmt.Sprintf("clickhouse://%s:%s@%s:%d/%s",
 		c.Username, c.Password, c.Host, c.Port, c.Database)
+}
+
+type AnomalyConfig struct {
+	Enabled            bool              `mapstructure:"enabled"`
+	Alpha              float64           `mapstructure:"alpha"`
+	DeviationThreshold float64           `mapstructure:"deviation_threshold"`
+	MinSamples         int               `mapstructure:"min_samples"`
+	CooldownSeconds    int               `mapstructure:"cooldown_seconds"`
+	AlertManager       AlertManagerConfig `mapstructure:"alertmanager"`
+}
+
+type AlertManagerConfig struct {
+	Enabled   bool   `mapstructure:"enabled"`
+	URL       string `mapstructure:"url"`
+	TimeoutMs int    `mapstructure:"timeout_ms"`
+}
+
+type CompressionConfig struct {
+	Enabled             bool    `mapstructure:"enabled"`
+	CompressionLevel    int     `mapstructure:"compression_level"`
+	MaxCacheSize        int     `mapstructure:"max_cache_size"`
+	SimilarityThreshold float64 `mapstructure:"similarity_threshold"`
+}
+
+type FlameGraphConfig struct {
+	Enabled        bool `mapstructure:"enabled"`
+	DefaultWidth   int  `mapstructure:"default_width"`
+	HeightPerFrame int  `mapstructure:"height_per_frame"`
+	MaxDepth       int  `mapstructure:"max_depth"`
+}
+
+type EnvoyConfig struct {
+	Enabled      bool   `mapstructure:"enabled"`
+	DetectAllPorts bool `mapstructure:"detect_all_ports"`
 }

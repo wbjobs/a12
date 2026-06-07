@@ -12,8 +12,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/ebpf-tracing/ebpf-apm/pkg/anomaly"
+	"github.com/ebpf-tracing/ebpf-apm/pkg/compression"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/config"
 	ebpfpkg "github.com/ebpf-tracing/ebpf-apm/pkg/ebpf"
+	"github.com/ebpf-tracing/ebpf-apm/pkg/flamegraph"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/model"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/sampling"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/storage"
@@ -21,13 +24,15 @@ import (
 )
 
 type Server struct {
-	engine      *gin.Engine
-	store       *storage.ClickHouseStore
-	sampler     *sampling.DynamicSampler
-	tracer      *ebpfpkg.Tracer
-	correlator  *trace.Correlator
-	server      *http.Server
-	cfg         *config.ServerConfig
+	engine         *gin.Engine
+	store          *storage.ClickHouseStore
+	sampler        *sampling.DynamicSampler
+	tracer         *ebpfpkg.Tracer
+	correlator     *trace.Correlator
+	anomalyDetector *anomaly.AnomalyDetector
+	compressor     *compression.Compressor
+	server         *http.Server
+	cfg            *config.ServerConfig
 }
 
 type APIResponse struct {
@@ -49,18 +54,21 @@ type TraceSearchRequest struct {
 }
 
 func NewServer(cfg *config.ServerConfig, store *storage.ClickHouseStore, sampler *sampling.DynamicSampler,
-	tracer *ebpfpkg.Tracer, correlator *trace.Correlator) *Server {
+	tracer *ebpfpkg.Tracer, correlator *trace.Correlator,
+	anomalyDetector *anomaly.AnomalyDetector, compressor *compression.Compressor) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery(), corsMiddleware(), loggingMiddleware())
 
 	s := &Server{
-		engine:     engine,
-		store:      store,
-		sampler:    sampler,
-		tracer:     tracer,
-		correlator: correlator,
-		cfg:        cfg,
+		engine:          engine,
+		store:           store,
+		sampler:         sampler,
+		tracer:          tracer,
+		correlator:      correlator,
+		anomalyDetector: anomalyDetector,
+		compressor:      compressor,
+		cfg:             cfg,
 	}
 
 	s.registerRoutes()
@@ -71,11 +79,14 @@ func (s *Server) registerRoutes() {
 	api := s.engine.Group("/api/v1")
 	{
 		api.GET("/trace/:traceId", s.getTrace)
+		api.GET("/trace/:traceId/flamegraph", s.getFlameGraph)
 		api.GET("/traces", s.searchTraces)
 		api.GET("/services", s.getServices)
 		api.GET("/services/:name/stats", s.getServiceStats)
 		api.GET("/service-map", s.getServiceMap)
 		api.GET("/sampling/stats", s.getSamplingStats)
+		api.GET("/anomaly/stats", s.getAnomalyStats)
+		api.GET("/compression/stats", s.getCompressionStats)
 		api.GET("/health", s.healthCheck)
 		api.GET("/system/stats", s.getSystemStats)
 	}
@@ -362,6 +373,166 @@ func (s *Server) getSystemStats(c *gin.Context) {
 		Code:    200,
 		Message: "success",
 		Data:    stats,
+	})
+}
+
+func (s *Server) getFlameGraph(c *gin.Context) {
+	traceID := c.Param("traceId")
+	format := c.DefaultQuery("format", "svg")
+	width := c.DefaultQuery("width", "1200")
+
+	if traceID == "" {
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Code:    400,
+			Message: "traceId is required",
+		})
+		return
+	}
+
+	rootSpan, err := s.store.GetTraceTree(context.Background(), traceID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Code:    500,
+			Message: fmt.Sprintf("Failed to get trace: %v", err),
+		})
+		return
+	}
+
+	if rootSpan == nil {
+		c.JSON(http.StatusNotFound, APIResponse{
+			Code:    404,
+			Message: "Trace not found",
+		})
+		return
+	}
+
+	title := fmt.Sprintf("Trace %s Flame Graph", traceID)
+	fg := flamegraph.NewFlameGraph(rootSpan, title)
+	if fg == nil {
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Code:    500,
+			Message: "Failed to generate flame graph",
+		})
+		return
+	}
+
+	switch format {
+	case "folded":
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.String(http.StatusOK, fg.ToFolded())
+	case "stats":
+		c.JSON(http.StatusOK, APIResponse{
+			Code:    200,
+			Message: "success",
+			Data: gin.H{
+				"frames":    fg.GetFrameStats(),
+				"hot_spots": fg.GetHotSpots(10),
+			},
+		})
+	default:
+		widthInt, _ := strconv.Atoi(width)
+		if widthInt <= 0 {
+			widthInt = 1200
+		}
+		config := &flamegraph.SVGConfig{
+			Width:          widthInt,
+			HeightPerFrame: 18,
+			FontSize:       12,
+			Title:          title,
+		}
+		svg, err := fg.ToSVG(config)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, APIResponse{
+				Code:    500,
+				Message: fmt.Sprintf("Failed to generate SVG: %v", err),
+			})
+			return
+		}
+		c.Header("Content-Type", "image/svg+xml")
+		c.Header("Content-Disposition", fmt.Sprintf("inline; filename=\"flamegraph-%s.svg\"", traceID))
+		c.String(http.StatusOK, svg)
+	}
+}
+
+func (s *Server) getAnomalyStats(c *gin.Context) {
+	if s.anomalyDetector == nil {
+		c.JSON(http.StatusOK, APIResponse{
+			Code:    200,
+			Message: "anomaly detection disabled",
+			Data:    nil,
+		})
+		return
+	}
+
+	allStats := s.anomalyDetector.GetAllStats()
+
+	result := make([]map[string]interface{}, 0, len(allStats))
+	for key, stats := range allStats {
+		result = append(result, map[string]interface{}{
+			"service":    key.ServiceName,
+			"operation":  key.Operation,
+			"protocol":   key.Protocol,
+			"count":      stats.Count,
+			"mean":       stats.Mean,
+			"std_dev":    stats.StdDev,
+			"ewma":       stats.EWMA,
+			"ewma_var":   stats.EWMAVar,
+			"threshold":  stats.EWMA + 3.0*stats.StdDev,
+			"last_update": stats.LastUpdate,
+		})
+	}
+
+	c.JSON(http.StatusOK, APIResponse{
+		Code:    200,
+		Message: "success",
+		Data: gin.H{
+			"operations": result,
+			"total":      len(result),
+		},
+	})
+}
+
+func (s *Server) getCompressionStats(c *gin.Context) {
+	if s.compressor == nil {
+		c.JSON(http.StatusOK, APIResponse{
+			Code:    200,
+			Message: "compression disabled",
+			Data:    nil,
+		})
+		return
+	}
+
+	stats := s.compressor.GetStats()
+	signatures := s.compressor.GetSignatureCache()
+
+	topSignatures := make([]map[string]interface{}, 0)
+	for _, sig := range signatures {
+		if sig.Count > 1 {
+			topSignatures = append(topSignatures, map[string]interface{}{
+				"hash":        sig.Hash,
+				"operations":  sig.Operations,
+				"depth":       sig.Depth,
+				"count":       sig.Count,
+				"structure":   sig.Structure,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, APIResponse{
+		Code:    200,
+		Message: "success",
+		Data: gin.H{
+			"total_spans":        stats.TotalSpans,
+			"compressed_spans":   stats.CompressedSpans,
+			"total_original_bytes": stats.TotalOriginal,
+			"total_compressed_bytes": stats.TotalCompressed,
+			"compression_ratio":  stats.CompressionRatio,
+			"savings_percent":    (1 - 1/stats.CompressionRatio) * 100,
+			"cache_hits":         stats.CacheHits,
+			"cache_misses":       stats.CacheMisses,
+			"duplicate_subtrees": len(topSignatures),
+			"top_signatures":     topSignatures,
+		},
 	})
 }
 
