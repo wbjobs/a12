@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  gateway:
+    build:
+      context: ./gateway
+    container_name: demo-gateway
+    ports:
+      - "8081:8081"
+    depends_on:
+      - user-service
+      - order-service
+    environment:
+      - USER_SERVICE_URL=http://user-service:8082
+      - ORDER_SERVICE_URL=http://order-service:8083
+    networks:
+      - demo
+
+  user-service:
+    build:
+      context: ./user-service
+    container_name: demo-user-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_ADDR=redis:6379
+    networks:
+      - demo
+
+  order-service:
+    build:
+      context: ./order-service
+    container_name: demo-order-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_ADDR=redis:6379
+    networks:
+      - demo
+
+  redis:
+    image: redis:7-alpine
+    container_name: demo-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - demo
+
+networks:
+  demo:
+    driver: bridge

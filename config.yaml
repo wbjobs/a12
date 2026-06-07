@@ -1,0 +1,32 @@
+server:
+  http_port: 8080
+  grpc_port: 50051
+
+clickhouse:
+  host: localhost
+  port: 9000
+  database: ebpf_apm
+  username: default
+  password: ""
+  max_open_conns: 50
+  max_idle_conns: 10
+
+sampling:
+  high_latency_threshold_ms: 500
+  high_latency_sample_rate: 1.0
+  low_latency_sample_rate: 0.01
+
+ebpf:
+  perf_buffer_size: 8192
+  poll_timeout_ms: 100
+
+protocols:
+  http:
+    enabled: true
+    ports: [80, 8080, 3000, 8000, 9090]
+  grpc:
+    enabled: true
+    ports: [50051, 9000, 7000]
+  redis:
+    enabled: true
+    ports: [6379]

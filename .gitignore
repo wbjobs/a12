@@ -1,34 +1,35 @@
-﻿# System
+﻿# Binaries
+bin/
+*.exe
+*.test
+*.out
+
+# Go workspace
+go.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
 .DS_Store
 Thumbs.db
-desktop.ini
 
 # Logs
 *.log
 logs/
 
-# Temp
+# eBPF generated files
+pkg/ebpf/bpf_bpf*.go
+
+# Docker volumes
+clickhouse_data/
+
+# Test coverage
+coverage.out
+
+# Temporary files
 *.tmp
-*.bak
-*.swp
-
-# Build / Dependencies
-node_modules/
-dist/
-build/
-out/
-venv/
-env/
-__pycache__/
-*.pyc
-
-# IDE
-.idea/
-.vscode/
-*.suo
-*.user
-*.sln.cache
-
-# Env
-.env
-.env.local
+*.temp
