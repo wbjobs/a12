@@ -13,17 +13,21 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/ebpf-tracing/ebpf-apm/pkg/config"
+	ebpfpkg "github.com/ebpf-tracing/ebpf-apm/pkg/ebpf"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/model"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/sampling"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/storage"
+	"github.com/ebpf-tracing/ebpf-apm/pkg/trace"
 )
 
 type Server struct {
-	engine   *gin.Engine
-	store    *storage.ClickHouseStore
-	sampler  *sampling.DynamicSampler
-	server   *http.Server
-	cfg      *config.ServerConfig
+	engine      *gin.Engine
+	store       *storage.ClickHouseStore
+	sampler     *sampling.DynamicSampler
+	tracer      *ebpfpkg.Tracer
+	correlator  *trace.Correlator
+	server      *http.Server
+	cfg         *config.ServerConfig
 }
 
 type APIResponse struct {
@@ -44,16 +48,19 @@ type TraceSearchRequest struct {
 	Offset       int     `form:"offset,default=0"`
 }
 
-func NewServer(cfg *config.ServerConfig, store *storage.ClickHouseStore, sampler *sampling.DynamicSampler) *Server {
+func NewServer(cfg *config.ServerConfig, store *storage.ClickHouseStore, sampler *sampling.DynamicSampler,
+	tracer *ebpfpkg.Tracer, correlator *trace.Correlator) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	engine := gin.New()
 	engine.Use(gin.Recovery(), corsMiddleware(), loggingMiddleware())
 
 	s := &Server{
-		engine:  engine,
-		store:   store,
-		sampler: sampler,
-		cfg:     cfg,
+		engine:     engine,
+		store:      store,
+		sampler:    sampler,
+		tracer:     tracer,
+		correlator: correlator,
+		cfg:        cfg,
 	}
 
 	s.registerRoutes()
@@ -70,6 +77,7 @@ func (s *Server) registerRoutes() {
 		api.GET("/service-map", s.getServiceMap)
 		api.GET("/sampling/stats", s.getSamplingStats)
 		api.GET("/health", s.healthCheck)
+		api.GET("/system/stats", s.getSystemStats)
 	}
 
 	s.engine.GET("/metrics", gin.WrapH(promhttp.Handler()))
@@ -287,6 +295,73 @@ func (s *Server) healthCheck(c *gin.Context) {
 			"services_count": len(services),
 			"timestamp":      time.Now().Unix(),
 		},
+	})
+}
+
+func (s *Server) getSystemStats(c *gin.Context) {
+	stats := make(map[string]interface{})
+
+	if s.tracer != nil {
+		bpfStats := s.tracer.GetStats()
+		stats["ebpf"] = bpfStats
+		stats["ebpf_drop_rate"] = float64(0)
+		if bpfStats.EventsTotal > 0 {
+			stats["ebpf_drop_rate"] = float64(bpfStats.EventsDropped+bpfStats.RingbufDropped) / float64(bpfStats.EventsTotal) * 100
+		}
+	}
+
+	if s.correlator != nil {
+		corrStats := s.correlator.GetStats()
+		stats["correlator"] = corrStats
+		stats["correlator_drop_rate"] = float64(0)
+		if corrStats.TotalEvents > 0 {
+			stats["correlator_drop_rate"] = float64(corrStats.DroppedEvents) / float64(corrStats.TotalEvents) * 100
+		}
+	}
+
+	if s.store != nil {
+		chStats := s.store.GetStats()
+		stats["clickhouse"] = chStats
+		stats["clickhouse_drop_rate"] = float64(0)
+		if chStats.TotalSpans > 0 {
+			stats["clickhouse_drop_rate"] = float64(chStats.DroppedSpans) / float64(chStats.TotalSpans) * 100
+		}
+		stats["queue_usage_percent"] = float64(chStats.QueueSize) / float64(chStats.QueueCapacity) * 100
+	}
+
+	if s.sampler != nil {
+		stats["sampling"] = s.sampler.Stats()
+	}
+
+	alerts := make([]string, 0)
+	warnings := make([]string, 0)
+
+	if ebpfStats, ok := stats["ebpf"].(ebpfpkg.BPFStats); ok {
+		if ebpfStats.EventsDropped > 100 {
+			alerts = append(alerts, fmt.Sprintf("High eBPF event drop: %d events", ebpfStats.EventsDropped))
+		}
+		if ebpfStats.Connections > 500000 {
+			warnings = append(warnings, fmt.Sprintf("High connection count: %d", ebpfStats.Connections))
+		}
+	}
+
+	if chStats, ok := stats["clickhouse"].(storage.ClickHouseStats); ok {
+		if chStats.QueueSize > chStats.QueueCapacity*8/10 {
+			alerts = append(alerts, fmt.Sprintf("Write queue almost full: %d/%d", chStats.QueueSize, chStats.QueueCapacity))
+		}
+		if chStats.FailedBatches > 10 {
+			alerts = append(alerts, fmt.Sprintf("High batch failures: %d batches", chStats.FailedBatches))
+		}
+	}
+
+	stats["alerts"] = alerts
+	stats["warnings"] = warnings
+	stats["timestamp"] = time.Now().Unix()
+
+	c.JSON(http.StatusOK, APIResponse{
+		Code:    200,
+		Message: "success",
+		Data:    stats,
 	})
 }
 

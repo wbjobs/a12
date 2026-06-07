@@ -21,13 +21,17 @@ type ServerConfig struct {
 }
 
 type ClickHouseConfig struct {
-	Host         string `mapstructure:"host"`
-	Port         int    `mapstructure:"port"`
-	Database     string `mapstructure:"database"`
-	Username     string `mapstructure:"username"`
-	Password     string `mapstructure:"password"`
-	MaxOpenConns int    `mapstructure:"max_open_conns"`
-	MaxIdleConns int    `mapstructure:"max_idle_conns"`
+	Host          string `mapstructure:"host"`
+	Port          int    `mapstructure:"port"`
+	Database      string `mapstructure:"database"`
+	Username      string `mapstructure:"username"`
+	Password      string `mapstructure:"password"`
+	MaxOpenConns  int    `mapstructure:"max_open_conns"`
+	MaxIdleConns  int    `mapstructure:"max_idle_conns"`
+	BatchSize     int    `mapstructure:"batch_size"`
+	QueueCapacity int    `mapstructure:"queue_capacity"`
+	FlushInterval int    `mapstructure:"flush_interval_seconds"`
+	MaxRetries    int    `mapstructure:"max_retries"`
 }
 
 type SamplingConfig struct {

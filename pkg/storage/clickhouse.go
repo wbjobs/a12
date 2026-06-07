@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -15,17 +17,53 @@ import (
 	"github.com/ebpf-tracing/ebpf-apm/pkg/model"
 )
 
+type ClickHouseStats struct {
+	TotalSpans        uint64 `json:"total_spans"`
+	FlushedBatches    uint64 `json:"flushed_batches"`
+	FailedBatches     uint64 `json:"failed_batches"`
+	RetriedBatches    uint64 `json:"retried_batches"`
+	DroppedSpans     uint64 `json:"dropped_spans"`
+	QueueSize          uint64 `json:"queue_size"`
+	QueueCapacity    uint64 `json:"queue_capacity"`
+}
+
 type ClickHouseStore struct {
-	conn     driver.Conn
-	database string
-	batch    []*model.Span
-	batchSize int
-	mu       chan struct{}
+	conn          driver.Conn
+	database      string
+	writeQueue    chan *model.Span
+	queueCapacity int
+	batchSize     int
+	flushInterval time.Duration
+	maxRetries    int
+	stats         ClickHouseStats
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
+	mu            sync.Mutex
 }
 
 func NewClickHouseStore(cfg *config.ClickHouseConfig) (*ClickHouseStore, error) {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	
+
+	batchSize := 10000
+	if cfg.BatchSize > 0 {
+		batchSize = cfg.BatchSize
+	}
+
+	queueCapacity := 100000
+	if cfg.QueueCapacity > 0 {
+		queueCapacity = cfg.QueueCapacity
+	}
+
+	flushInterval := 5 * time.Second
+	if cfg.FlushInterval > 0 {
+		flushInterval = time.Duration(cfg.FlushInterval) * time.Second
+	}
+
+	maxRetries := 3
+	if cfg.MaxRetries > 0 {
+		maxRetries = cfg.MaxRetries
+	}
+
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Addr: []string{addr},
 		Auth: clickhouse.Auth{
@@ -34,11 +72,18 @@ func NewClickHouseStore(cfg *config.ClickHouseConfig) (*ClickHouseStore, error) 
 			Password: cfg.Password,
 		},
 		Settings: clickhouse.Settings{
-			"max_execution_time": 60,
+			"max_execution_time":        120,
+			"async_insert":           1,
+			"wait_for_async_insert": 0,
+			"async_insert_busy_timeout_ms": 60000,
+			"parts_to_delay_insert":    10000,
+			"parts_to_throw_insert":  50000,
+			"max_partitions_per_insert_block": 1000,
+			"insert_quorum":            1,
 		},
-		DialTimeout:     5 * time.Second,
-		MaxOpenConns:    cfg.MaxOpenConns,
-		MaxIdleConns:    cfg.MaxIdleConns,
+		DialTimeout:     10 * time.Second,
+		MaxOpenConns: cfg.MaxOpenConns,
+		MaxIdleConns: cfg.MaxIdleConns,
 		ConnMaxLifetime: 1 * time.Hour,
 		Compression: &clickhouse.Compression{
 			Method: clickhouse.CompressionLZ4,
@@ -49,7 +94,7 @@ func NewClickHouseStore(cfg *config.ClickHouseConfig) (*ClickHouseStore, error) 
 		return nil, fmt.Errorf("opening clickhouse connection: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := conn.Ping(ctx); err != nil {
@@ -57,26 +102,27 @@ func NewClickHouseStore(cfg *config.ClickHouseConfig) (*ClickHouseStore, error) 
 	}
 
 	store := &ClickHouseStore{
-		conn:      conn,
-		database:  cfg.Database,
-		batch:     make([]*model.Span, 0, 1000),
-		batchSize: 1000,
-		mu:        make(chan struct{}, 1),
+		conn:          conn,
+		database:      cfg.Database,
+		writeQueue:    make(chan *model.Span, queueCapacity),
+		queueCapacity: queueCapacity,
+		batchSize:     batchSize,
+		flushInterval: flushInterval,
+		maxRetries:    maxRetries,
+		stopChan:      make(chan struct{}),
 	}
 
-	go store.flushLoop()
+	store.wg.Add(2)
+	go store.batchWriter()
+	go store.statsReporter()
+
+	log.Printf("ClickHouse store initialized: batch_size=%d, flush_interval=%v, queue_capacity=%d",
+		batchSize, flushInterval, queueCapacity)
+
 	return store, nil
 }
 
 func (s *ClickHouseStore) InitSchema(ctx context.Context) error {
-	sqlFiles := []string{
-		"scripts/init_clickhouse.sql",
-	}
-
-	for _, file := range sqlFiles {
-		log.Printf("Executing schema file: %s", file)
-	}
-
 	queries := []string{
 		`CREATE DATABASE IF NOT EXISTS ` + s.database,
 		`USE ` + s.database,
@@ -101,11 +147,15 @@ func (s *ClickHouseStore) InitSchema(ctx context.Context) error {
 			dest_port UInt16,
 			pid UInt32,
 			comm String,
-			path String
+			path String,
+			tags String
 		) ENGINE = MergeTree()
 		PARTITION BY toYYYYMM(timestamp)
 		ORDER BY (timestamp, trace_id, span_id)
-		TTL timestamp + INTERVAL 30 DAY`,
+		TTL timestamp + INTERVAL 30 DAY
+		SETTINGS index_granularity = 8192,
+		         parts_to_delay_insert = 10000,
+		         parts_to_throw_insert = 50000`,
 	}
 
 	for _, query := range queries {
@@ -119,42 +169,125 @@ func (s *ClickHouseStore) InitSchema(ctx context.Context) error {
 }
 
 func (s *ClickHouseStore) SaveSpan(ctx context.Context, span *model.Span) error {
-	s.mu <- struct{}{}
-	defer func() { <-s.mu }()
+	atomic.AddUint64(&s.stats.TotalSpans, 1)
 
-	s.batch = append(s.batch, span)
-
-	if len(s.batch) >= s.batchSize {
-		return s.flushBatchLocked(ctx)
-	}
-
-	return nil
-}
-
-func (s *ClickHouseStore) Flush(ctx context.Context) error {
-	s.mu <- struct{}{}
-	defer func() { <-s.mu }()
-
-	return s.flushBatchLocked(ctx)
-}
-
-func (s *ClickHouseStore) flushBatchLocked(ctx context.Context) error {
-	if len(s.batch) == 0 {
+	select {
+	case s.writeQueue <- span:
 		return nil
+	default:
+		atomic.AddUint64(&s.stats.DroppedSpans, 1)
+		if atomic.LoadUint64(&s.stats.DroppedSpans)%1000 == 0 {
+			log.Printf("Warning: write queue full, dropped %d spans so far", atomic.LoadUint64(&s.stats.DroppedSpans))
+		}
+		return fmt.Errorf("write queue full")
+	}
+}
+
+func (s *ClickHouseStore) batchWriter() {
+	defer s.wg.Done()
+
+	batch := make([]*model.Span, 0, s.batchSize)
+	ticker := time.NewTicker(s.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopChan:
+			s.flushBatch(batch)
+			return
+
+		case span := <-s.writeQueue:
+			batch = append(batch, span)
+
+			if len(batch) >= s.batchSize {
+				s.flushBatch(batch)
+				batch = batch[:0]
+				ticker.Reset(s.flushInterval)
+			}
+
+		case <-ticker.C:
+			if len(batch) > 0 {
+				s.flushBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func (s *ClickHouseStore) flushBatch(batch []*model.Span) {
+	if len(batch) == 0 {
+		return
 	}
 
-	batch, err := s.conn.PrepareBatch(ctx, `INSERT INTO spans (
+	ctx := context.Background()
+
+	err := s.flushWithRetry(ctx, batch)
+	if err != nil {
+		atomic.AddUint64(&s.stats.FailedBatches, 1)
+		log.Printf("Error: failed to flush batch after %d retries: %v", s.maxRetries, err)
+		return
+	}
+
+	atomic.AddUint64(&s.stats.FlushedBatches, 1)
+	log.Printf("Flushed %d spans to ClickHouse", len(batch))
+}
+
+func (s *ClickHouseStore) flushWithRetry(ctx context.Context, batch []*model.Span) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= s.maxRetries; attempt++ {
+		if attempt > 0 {
+			atomic.AddUint64(&s.stats.RetriedBatches, 1)
+			backoff := time.Duration(1<<uint(attempt)) * 100 * time.Millisecond
+			time.Sleep(backoff)
+		}
+
+		err := s.doFlush(ctx, batch)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+		log.Printf("Warning: flush attempt %d/%d failed: %v", attempt+1, s.maxRetries, err)
+
+		if isTooManyParts(err) {
+			log.Printf("Too many parts error detected, increasing backoff...")
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	return fmt.Errorf("flush failed after %d attempts: %w", s.maxRetries, lastErr)
+}
+
+func (s *ClickHouseStore) doFlush(ctx context.Context, batch []*model.Span) error {
+	timeout := time.Duration(len(batch)/1000) * time.Second
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	if timeout > 60*time.Second {
+		timeout = 60 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	prepareBatch, err := s.conn.PrepareBatch(ctx, `INSERT INTO spans (
 		timestamp, trace_id, span_id, parent_span_id, service_name, operation,
 		protocol, event_type, start_time, end_time, duration_ms, error_code,
 		payload_size, payload, source_ip, dest_ip, source_port, dest_port,
-		pid, comm, path
+		pid, comm, path, tags
 	) VALUES`)
 	if err != nil {
 		return fmt.Errorf("preparing batch: %w", err)
 	}
 
-	for _, span := range s.batch {
-		err := batch.Append(
+	for _, span := range batch {
+		tags := ""
+		if len(span.Tags) > 0 {
+			tags = spanTagsToString(span.Tags)
+		}
+
+		err := prepareBatch.Append(
 			span.StartTime,
 			padString(span.TraceID, 32),
 			padString(span.SpanID, 16),
@@ -176,6 +309,7 @@ func (s *ClickHouseStore) flushBatchLocked(ctx context.Context) error {
 			span.PID,
 			span.Comm,
 			span.Path,
+			tags,
 		)
 		if err != nil {
 			log.Printf("Warning: failed to append span: %v", err)
@@ -183,25 +317,41 @@ func (s *ClickHouseStore) flushBatchLocked(ctx context.Context) error {
 		}
 	}
 
-	if err := batch.Send(); err != nil {
+	if err := prepareBatch.Send(); err != nil {
 		return fmt.Errorf("sending batch: %w", err)
 	}
 
-	log.Printf("Flushed %d spans to ClickHouse", len(s.batch))
-	s.batch = s.batch[:0]
 	return nil
 }
 
-func (s *ClickHouseStore) flushLoop() {
-	ticker := time.NewTicker(1 * time.Second)
+func (s *ClickHouseStore) Flush(ctx context.Context) error {
+	return nil
+}
+
+func (s *ClickHouseStore) statsReporter() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := s.Flush(ctx); err != nil {
-			log.Printf("Error flushing spans: %v", err)
-		}
-		cancel()
+		stats := s.GetStats()
+		log.Printf("ClickHouse Stats: total=%d, flushed=%d, failed=%d, retried=%d, dropped=%d, queue=%d/%d",
+			stats.TotalSpans, stats.FlushedBatches, stats.FailedBatches,
+			stats.RetriedBatches, stats.DroppedSpans,
+			stats.QueueSize, stats.QueueCapacity)
+	}
+}
+
+func (s *ClickHouseStore) GetStats() ClickHouseStats {
+	return ClickHouseStats{
+		TotalSpans:     atomic.LoadUint64(&s.stats.TotalSpans),
+		FlushedBatches:  atomic.LoadUint64(&s.stats.FlushedBatches),
+		FailedBatches:   atomic.LoadUint64(&s.stats.FailedBatches),
+		RetriedBatches:   atomic.LoadUint64(&s.stats.RetriedBatches),
+		DroppedSpans:    atomic.LoadUint64(&s.stats.DroppedSpans),
+		QueueSize:       uint64(len(s.writeQueue)),
+		QueueCapacity: uint64(s.queueCapacity),
 	}
 }
 
@@ -214,7 +364,7 @@ func (s *ClickHouseStore) GetTraceByID(ctx context.Context, traceID string) (*mo
 		trace_id, span_id, parent_span_id, service_name, operation,
 		protocol, event_type, start_time, end_time, duration_ms, error_code,
 		payload_size, payload, source_ip, dest_ip, source_port, dest_port,
-		pid, comm, path
+		pid, comm, path, tags
 	FROM spans 
 	WHERE trace_id = ? 
 	ORDER BY start_time ASC`
@@ -229,13 +379,14 @@ func (s *ClickHouseStore) GetTraceByID(ctx context.Context, traceID string) (*mo
 	for rows.Next() {
 		span := &model.Span{}
 		var sourceIP, destIP net.IP
-		
+		var tags string
+
 		err := rows.Scan(
 			&span.TraceID, &span.SpanID, &span.ParentSpanID,
 			&span.ServiceName, &span.Operation, &span.Protocol, &span.EventType,
 			&span.StartTime, &span.EndTime, &span.DurationMs, &span.ErrorCode,
 			&span.PayloadSize, &span.Payload, &sourceIP, &destIP,
-			&span.SourcePort, &span.DestPort, &span.PID, &span.Comm, &span.Path,
+			&span.SourcePort, &span.DestPort, &span.PID, &span.Comm, &span.Path, &tags,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning span: %w", err)
@@ -246,6 +397,7 @@ func (s *ClickHouseStore) GetTraceByID(ctx context.Context, traceID string) (*mo
 		span.ParentSpanID = strings.TrimSpace(span.ParentSpanID)
 		span.SourceIP = sourceIP.String()
 		span.DestIP = destIP.String()
+		span.Tags = parseSpanTags(tags)
 
 		spans = append(spans, span)
 	}
@@ -390,13 +542,27 @@ func (s *ClickHouseStore) GetServiceStats(ctx context.Context, serviceName strin
 	operations := make([]map[string]interface{}, 0)
 
 	for rows.Next() {
-		var op map[string]interface{} = make(map[string]interface{})
+		var operation, protocol string
+		var callCount, errorCount uint64
+		var avgDuration, p50, p95, p99 float64
+
 		err := rows.Scan(
-			&op["operation"], &op["protocol"], &op["call_count"], &op["error_count"],
-			&op["avg_duration_ms"], &op["p50_duration_ms"], &op["p95_duration_ms"], &op["p99_duration_ms"],
+			&operation, &protocol, &callCount, &errorCount,
+			&avgDuration, &p50, &p95, &p99,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning stats: %w", err)
+		}
+
+		op := map[string]interface{}{
+			"operation":       operation,
+			"protocol":        protocol,
+			"call_count":      callCount,
+			"error_count":     errorCount,
+			"avg_duration_ms": avgDuration,
+			"p50_duration_ms": p50,
+			"p95_duration_ms": p95,
+			"p99_duration_ms": p99,
 		}
 		operations = append(operations, op)
 	}
@@ -430,13 +596,25 @@ func (s *ClickHouseStore) GetServiceMap(ctx context.Context, startTime, endTime 
 
 	edges := make([]map[string]interface{}, 0)
 	for rows.Next() {
-		edge := make(map[string]interface{})
+		var sourceService, destService, protocol string
+		var callCount, errorCount uint64
+		var avgDuration float64
+
 		err := rows.Scan(
-			&edge["source_service"], &edge["dest_service"], &edge["protocol"],
-			&edge["call_count"], &edge["error_count"], &edge["avg_duration_ms"],
+			&sourceService, &destService, &protocol,
+			&callCount, &errorCount, &avgDuration,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning edge: %w", err)
+		}
+
+		edge := map[string]interface{}{
+			"source_service":   sourceService,
+			"dest_service":     destService,
+			"protocol":         protocol,
+			"call_count":       callCount,
+			"error_count":      errorCount,
+			"avg_duration_ms":  avgDuration,
 		}
 		edges = append(edges, edge)
 	}
@@ -445,14 +623,42 @@ func (s *ClickHouseStore) GetServiceMap(ctx context.Context, startTime, endTime 
 }
 
 func (s *ClickHouseStore) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	close(s.stopChan)
+	s.wg.Wait()
 
-	if err := s.Flush(ctx); err != nil {
-		log.Printf("Warning: error flushing on close: %v", err)
-	}
+	close(s.writeQueue)
 
 	return s.conn.Close()
+}
+
+func isTooManyParts(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "Too many parts")
+}
+
+func spanTagsToString(tags map[string]interface{}) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	var parts []string
+	for k, v := range tags {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+	}
+	return strings.Join(parts, ",")
+}
+
+func parseSpanTags(s string) map[string]interface{} {
+	tags := make(map[string]interface{})
+	if s == "" {
+		return tags
+	}
+	parts := strings.Split(s, ",")
+	for _, part := range parts {
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			tags[kv[0]] = kv[1]
+		}
+	}
+	return tags
 }
 
 func padString(s string, length int) string {

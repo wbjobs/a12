@@ -10,6 +10,10 @@ clickhouse:
   password: ""
   max_open_conns: 50
   max_idle_conns: 10
+  batch_size: 10000
+  queue_capacity: 100000
+  flush_interval_seconds: 5
+  max_retries: 3
 
 sampling:
   high_latency_threshold_ms: 500

@@ -93,7 +93,7 @@ func main() {
 	}
 
 	if *enableAPI {
-		app.apiServer = api.NewServer(&config.AppConfig.Server, app.store, app.dynamicSampler)
+		app.apiServer = api.NewServer(&config.AppConfig.Server, app.store, app.dynamicSampler, app.tracer, app.correlator)
 		go func() {
 			if err := app.apiServer.Start(); err != nil {
 				log.Printf("API server error: %v", err)

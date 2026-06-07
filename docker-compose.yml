@@ -12,6 +12,10 @@ services:
       - CLICKHOUSE_DB=ebpf_apm
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
+      - CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.d/custom-config.xml
+    configs:
+      - source: clickhouse-config
+        target: /etc/clickhouse-server/config.d/custom-config.xml
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./scripts/init_clickhouse.sql:/docker-entrypoint-initdb.d/init.sql
@@ -70,6 +74,10 @@ services:
 
 volumes:
   clickhouse_data:
+
+configs:
+  clickhouse-config:
+    file: ./scripts/clickhouse-config.xml
 
 networks:
   ebpf-apm:

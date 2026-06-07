@@ -223,14 +223,23 @@ func (s *TraceLevelSampler) ShouldSample(span *model.Span) bool {
 		return s.innerSampler.ShouldSample(span)
 	}
 
-	if sampled, ok := s.sampledTraces.Load(span.TraceID); ok {
-		return sampled.(bool)
+	if entry, ok := s.sampledTraces.Load(span.TraceID); ok {
+		if sampled, ok := entry.(struct {
+			Sampled   bool
+			Timestamp time.Time
+		}); ok {
+			return sampled.Sampled
+		}
 	}
 
 	shouldSample := s.innerSampler.ShouldSample(span)
-	s.sampledTraces.Store(span.TraceID, shouldSample)
-
-	go s.cleanupOldTraces()
+	s.sampledTraces.Store(span.TraceID, struct {
+		Sampled   bool
+		Timestamp time.Time
+	}{
+		Sampled:   shouldSample,
+		Timestamp: time.Now(),
+	})
 
 	return shouldSample
 }
@@ -240,22 +249,46 @@ func (s *TraceLevelSampler) SamplingRate(span *model.Span) float64 {
 }
 
 func (s *TraceLevelSampler) cleanupOldTraces() {
-	time.Sleep(5 * time.Minute)
+	for {
+		time.Sleep(5 * time.Minute)
 
-	cutoff := time.Now().Add(-10 * time.Minute).UnixNano()
+		cutoff := time.Now().Add(-10 * time.Minute)
 
-	s.sampledTraces.Range(func(key, value interface{}) bool {
-		return true
-	})
+		var toDelete []string
+		s.sampledTraces.Range(func(key, value interface{}) bool {
+			if entry, ok := value.(struct {
+				Sampled   bool
+				Timestamp time.Time
+			}); ok && entry.Timestamp.Before(cutoff) {
+				toDelete = append(toDelete, key.(string))
+			}
+			return true
+		})
+
+		for _, k := range toDelete {
+			s.sampledTraces.Delete(k)
+		}
+	}
 }
 
 func (s *TraceLevelSampler) MarkTraceSampled(traceID string) {
-	s.sampledTraces.Store(traceID, true)
+	s.sampledTraces.Store(traceID, struct {
+		Sampled   bool
+		Timestamp time.Time
+	}{
+		Sampled:   true,
+		Timestamp: time.Now(),
+	})
 }
 
 func (s *TraceLevelSampler) IsTraceSampled(traceID string) bool {
-	if sampled, ok := s.sampledTraces.Load(traceID); ok {
-		return sampled.(bool)
+	if entry, ok := s.sampledTraces.Load(traceID); ok {
+		if sampled, ok := entry.(struct {
+			Sampled   bool
+			Timestamp time.Time
+		}); ok {
+			return sampled.Sampled
+		}
 	}
 	return false
 }

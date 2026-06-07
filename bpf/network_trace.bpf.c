@@ -7,9 +7,18 @@
 #define TASK_COMM_LEN 16
 #define MAX_PAYLOAD_SIZE 1024
 #define MAX_PATH_LEN 256
+#define MAX_CONNECTIONS 1048576
 
 typedef unsigned int __u32;
 typedef unsigned long long __u64;
+
+struct event_stats {
+    __u64 events_total;
+    __u64 events_dropped;
+    __u64 events_sent;
+    __u64 connections_count;
+    __u64 ringbuf_dropped;
+};
 
 enum event_type {
     EVENT_CONNECT = 0,
@@ -71,24 +80,51 @@ struct trace_event {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, MAX_CONNECTIONS);
     __type(key, struct connection_key);
     __type(value, struct connection_info);
 } connections SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
+    __uint(max_entries, MAX_CONNECTIONS);
     __type(key, struct socket_key);
     __type(value, struct connection_key);
 } socket_to_conn SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-    __uint(key_size, sizeof(__u32));
-    __uint(value_size, sizeof(__u32));
-    __uint(max_entries, 4096);
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64 << 20);
 } events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct event_stats);
+} stats SEC(".maps");
+
+static __always_inline void update_stats(__u64 events_total, __u64 events_dropped, __u64 events_sent) {
+    __u32 key = 0;
+    struct event_stats *stats_val = bpf_map_lookup_elem(&stats, &key);
+    if (stats_val) {
+        stats_val->events_total += events_total;
+        stats_val->events_dropped += events_dropped;
+        stats_val->events_sent += events_sent;
+    }
+}
+
+static __always_inline void send_event(void *ctx, struct trace_event *event) {
+    __u64 flags = 0;
+    int ret;
+
+    ret = bpf_ringbuf_output(&events, event, sizeof(struct trace_event), flags);
+    if (ret == 0) {
+        update_stats(1, 0, 1);
+    } else {
+        update_stats(1, 1, 0);
+    }
+}
 
 static __always_inline void fill_common_info(struct trace_event *event) {
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -194,7 +230,7 @@ int BPF_KPROBE(tcp_connect, struct sock *sk) {
     };
     bpf_map_update_elem(&socket_to_conn, &sock_key, &conn_key, BPF_ANY);
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -206,7 +242,7 @@ int BPF_KRETPROBE(tcp_connect_ret, int ret) {
         fill_common_info(&event);
         event.event_type = EVENT_CONNECT;
         event.error_code = ret;
-        bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+        send_event(ctx, &event);
     }
     return 0;
 }
@@ -246,7 +282,7 @@ int BPF_KPROBE(tcp_accept, struct sock *sk, struct sock *newsk) {
     };
     bpf_map_update_elem(&socket_to_conn, &sock_key, &conn_key, BPF_ANY);
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -285,7 +321,7 @@ int BPF_KPROBE(udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len) {
         }
     }
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -302,7 +338,7 @@ int BPF_KPROBE(udp_recvmsg, struct sock *sk, struct msghdr *msg, size_t len) {
     event.dport = BPF_CORE_READ(sk, sk_num);
     event.protocol = detect_protocol(event.dport, event.sport);
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -341,7 +377,7 @@ int BPF_KPROBE(tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size) {
         }
     }
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -374,7 +410,7 @@ int BPF_KPROBE(tcp_cleanup_rbuf, struct sock *sk, int copied) {
         }
     }
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }
@@ -400,7 +436,7 @@ int BPF_KPROBE(tcp_close, struct sock *sk) {
     event.sport = BPF_CORE_READ(sk, sk_num);
     event.dport = BPF_CORE_READ(sk, sk_dport);
     
-    bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &event, sizeof(event));
+    send_event(ctx, &event);
     
     return 0;
 }

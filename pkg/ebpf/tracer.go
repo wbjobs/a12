@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
-	"golang.org/x/sys/unix"
+	"github.com/cilium/ebpf/ringbuf"
 
 	"github.com/ebpf-tracing/ebpf-apm/pkg/config"
 	"github.com/ebpf-tracing/ebpf-apm/pkg/model"
@@ -21,21 +24,39 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" bpf ../bpf/network_trace.bpf.c -- -I../bpf
 
+type BPFStats struct {
+	EventsTotal   uint64 `json:"events_total"`
+	EventsDropped uint64 `json:"events_dropped"`
+	EventsSent    uint64 `json:"events_sent"`
+	Connections   uint64 `json:"connections"`
+	RingbufDropped uint64 `json:"ringbuf_dropped"`
+}
+
 type Tracer struct {
-	objs         *bpfObjects
-	links        []link.Link
-	perfReader   *perf.Reader
-	eventChan    chan *model.RawTraceEvent
-	stopChan     chan struct{}
-	eventHandler func(*model.RawTraceEvent)
-	mu           sync.Mutex
-	running      bool
+	objs            *bpfObjects
+	links           []link.Link
+	ringbuf         *ringbuf.Reader
+	eventChan       chan *model.RawTraceEvent
+	stopChan        chan struct{}
+	eventHandler    func(*model.RawTraceEvent)
+	mu              sync.Mutex
+	running         bool
+	workers         int
+	stats           atomic.Value
+	processedEvents atomic.Uint64
+	droppedEvents   atomic.Uint64
 }
 
 func NewTracer(cfg *config.EBPFConfig) (*Tracer, error) {
+	workers := 4
+	if runtime.NumCPU() > workers {
+		workers = runtime.NumCPU()
+	}
+
 	t := &Tracer{
-		eventChan: make(chan *model.RawTraceEvent, 10000),
+		eventChan: make(chan *model.RawTraceEvent, 100000),
 		stopChan:  make(chan struct{}),
+		workers:   workers,
 	}
 
 	objs := bpfObjects{}
@@ -74,9 +95,9 @@ func NewTracer(cfg *config.EBPFConfig) (*Tracer, error) {
 		var err error
 
 		if kp.name == "tcp_connect_ret" {
-			l, err = link.Kretprobe(kp.name, kp.fn, nil)
+			l, err = link.Kretprobe(kp.name, kp.fn.(*ebpf.Program), nil)
 		} else {
-			l, err = link.Kprobe(kp.name, kp.fn, nil)
+			l, err = link.Kprobe(kp.name, kp.fn.(*ebpf.Program), nil)
 		}
 
 		if err != nil {
@@ -86,11 +107,13 @@ func NewTracer(cfg *config.EBPFConfig) (*Tracer, error) {
 		log.Printf("Attached kprobe: %s", kp.name)
 	}
 
-	reader, err := perf.NewReader(t.objs.Events, cfg.PerfBufferSize)
+	reader, err := ringbuf.NewReader(t.objs.Events)
 	if err != nil {
-		return nil, fmt.Errorf("creating perf reader: %w", err)
+		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
-	t.perfReader = reader
+	t.ringbuf = reader
+
+	go t.statsPoller()
 
 	return t, nil
 }
@@ -108,9 +131,13 @@ func (t *Tracer) Start(ctx context.Context) error {
 	t.running = true
 	t.mu.Unlock()
 
+	for i := 0; i < t.workers; i++ {
+		go t.eventWorker(ctx, i)
+	}
+
 	go t.pollEvents(ctx)
 
-	log.Println("eBPF tracer started successfully")
+	log.Printf("eBPF tracer started successfully with %d workers", t.workers)
 	return nil
 }
 
@@ -131,9 +158,9 @@ func (t *Tracer) Stop() error {
 		}
 	}
 
-	if t.perfReader != nil {
-		if err := t.perfReader.Close(); err != nil {
-			log.Printf("Warning: closing perf reader: %v", err)
+	if t.ringbuf != nil {
+		if err := t.ringbuf.Close(); err != nil {
+			log.Printf("Warning: closing ringbuf reader: %v", err)
 		}
 	}
 
@@ -149,9 +176,6 @@ func (t *Tracer) Stop() error {
 }
 
 func (t *Tracer) pollEvents(ctx context.Context) {
-	cfg := config.AppConfig.EBPF
-	pollTimeout := time.Duration(cfg.PollTimeoutMs) * time.Millisecond
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -159,36 +183,51 @@ func (t *Tracer) pollEvents(ctx context.Context) {
 		case <-t.stopChan:
 			return
 		default:
-			record, err := t.perfReader.ReadTimeout(pollTimeout)
+			record, err := t.ringbuf.Read()
 			if err != nil {
-				if perf.IsClosed(err) {
+				if err == ringbuf.ErrClosed {
 					return
 				}
-				if err, ok := err.(unix.Errno); ok && err == unix.ETIME {
+				if isTemporaryError(err) {
 					continue
 				}
-				log.Printf("Error reading perf record: %v", err)
+				log.Printf("Error reading ringbuf record: %v", err)
+				t.droppedEvents.Add(1)
 				continue
-			}
-
-			if record.LostSamples > 0 {
-				log.Printf("Lost %d samples", record.LostSamples)
 			}
 
 			event, err := parseRawEvent(record.RawSample)
 			if err != nil {
 				log.Printf("Error parsing event: %v", err)
+				t.droppedEvents.Add(1)
 				continue
-			}
-
-			if t.eventHandler != nil {
-				t.eventHandler(event)
 			}
 
 			select {
 			case t.eventChan <- event:
+				t.processedEvents.Add(1)
 			default:
-				log.Printf("Event channel full, dropping event")
+				t.droppedEvents.Add(1)
+				log.Printf("Warning: event channel full, dropping event")
+			}
+		}
+	}
+}
+
+func (t *Tracer) eventWorker(ctx context.Context, id int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.stopChan:
+			return
+		case event, ok := <-t.eventChan:
+			if !ok {
+				return
+			}
+
+			if t.eventHandler != nil {
+				t.eventHandler(event)
 			}
 		}
 	}
@@ -196,6 +235,60 @@ func (t *Tracer) pollEvents(ctx context.Context) {
 
 func (t *Tracer) Events() <-chan *model.RawTraceEvent {
 	return t.eventChan
+}
+
+func (t *Tracer) GetStats() BPFStats {
+	stats, _ := t.stats.Load().(BPFStats)
+	stats.EventsSent = t.processedEvents.Load()
+	stats.RingbufDropped = t.droppedEvents.Load()
+	return stats
+}
+
+func (t *Tracer) statsPoller() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		stats := t.readBPFStats()
+		t.stats.Store(stats)
+
+		if stats.EventsDropped > 0 {
+			log.Printf("BPF Stats: total=%d, dropped=%d, sent=%d, connections=%d, channel_dropped=%d",
+				stats.EventsTotal, stats.EventsDropped, stats.EventsSent,
+				stats.Connections, t.droppedEvents.Load())
+		}
+	}
+}
+
+func (t *Tracer) readBPFStats() BPFStats {
+	var stats BPFStats
+	var key uint32 = 0
+
+	var value struct {
+		EventsTotal   uint64
+		EventsDropped uint64
+		EventsSent    uint64
+		Connections   uint64
+		RingbufDropped uint64
+	}
+
+	if err := t.objs.Stats.Lookup(&key, &value); err == nil {
+		stats.EventsTotal = value.EventsTotal
+		stats.EventsDropped = value.EventsDropped
+		stats.EventsSent = value.EventsSent
+	}
+
+	if connMap, err := t.GetMap("connections"); err == nil {
+		iter := connMap.Iterate()
+		count := 0
+		var key, val []byte
+		for iter.Next(&key, &val) {
+			count++
+		}
+		stats.Connections = uint64(count)
+	}
+
+	return stats
 }
 
 func parseRawEvent(data []byte) (*model.RawTraceEvent, error) {
@@ -219,7 +312,31 @@ func (t *Tracer) GetMap(name string) (*ebpf.Map, error) {
 		return t.objs.SocketToConn, nil
 	case "events":
 		return t.objs.Events, nil
+	case "stats":
+		return t.objs.Stats, nil
 	default:
 		return nil, fmt.Errorf("map not found: %s", name)
 	}
+}
+
+func isTemporaryError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var tempErr interface{ Temporary() bool }
+	if errors.As(err, &tempErr) && tempErr.Temporary() {
+		return true
+	}
+
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	return false
 }

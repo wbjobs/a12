@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -329,68 +328,187 @@ func (p *RedisParser) CanHandle(port uint16, payload []byte) bool {
 }
 
 func (p *RedisParser) Parse(payload []byte, span *model.Span) (*RedisCommand, error) {
-	cmd := &RedisCommand{}
-
-	payloadStr := strings.TrimSpace(string(payload))
-
-	if len(payloadStr) == 0 {
-		return nil, fmt.Errorf("empty payload")
+	commands, err := p.ParseMultiple(payload)
+	if err != nil {
+		return nil, err
+	}
+	if len(commands) == 0 {
+		return nil, fmt.Errorf("no redis commands found")
 	}
 
-	first := payloadStr[0]
+	span.SetTag("redis_command_count", len(commands))
+
+	if len(commands) > 1 {
+		span.Operation = fmt.Sprintf("PIPELINE (%d commands)", len(commands))
+		span.SetTag("redis_pipeline", true)
+		var keys []string
+		for _, cmd := range commands {
+			if cmd.Key != "" {
+				keys = append(keys, cmd.Key)
+			}
+		}
+		if len(keys) > 0 {
+			span.SetTag("redis_keys", strings.Join(keys, ","))
+		}
+		return commands[0], nil
+	}
+
+	return commands[0], nil
+}
+
+func (p *RedisParser) ParseMultiple(payload []byte) ([]*RedisCommand, error) {
+	var commands []*RedisCommand
+	pos := 0
+
+	for pos < len(payload) {
+		cmd, n, err := p.parseSingle(payload[pos:])
+		if err != nil {
+			if len(commands) > 0 {
+				break
+			}
+			return nil, err
+		}
+		if cmd != nil {
+			commands = append(commands, cmd)
+		}
+		pos += n
+	}
+
+	return commands, nil
+}
+
+func (p *RedisParser) parseSingle(payload []byte) (*RedisCommand, int, error) {
+	if len(payload) == 0 {
+		return nil, 0, fmt.Errorf("empty payload")
+	}
+
+	first := payload[0]
 
 	if first == '*' {
-		lines := strings.Split(payloadStr, "\r\n")
-		if len(lines) < 3 {
-			return nil, fmt.Errorf("invalid RESP format")
-		}
-
-		numArgs, _ := strconv.Atoi(lines[0][1:])
-		args := make([]string, 0, numArgs)
-
-		idx := 1
-		for i := 0; i < numArgs && idx+1 < len(lines); i++ {
-			if lines[idx][0] == '$' {
-				idx++
-				if idx < len(lines) {
-					args = append(args, lines[idx])
-					idx++
-				}
-			}
-		}
-
-		if len(args) > 0 {
-			cmd.Command = strings.ToUpper(args[0])
-			if len(args) > 1 {
-				cmd.Key = args[1]
-			}
-			if len(args) > 2 {
-				cmd.Args = args[2:]
-			}
-		}
+		return p.parseRESPArray(payload)
 	} else if first == '+' || first == '-' || first == ':' || first == '$' {
-		cmd.IsResponse = true
-		if len(payloadStr) > 1 {
-			cmd.Command = string(first)
-			parts := strings.SplitN(payloadStr[1:], "\r\n")[0]
-			cmd.Key = parts
+		return p.parseRESPResponse(payload)
+	} else if first >= 'A' && first <= 'Z' {
+		return p.parseInlineCommand(payload)
+	}
+
+	return nil, 0, fmt.Errorf("invalid redis payload")
+}
+
+func (p *RedisParser) parseRESPArray(payload []byte) (*RedisCommand, int, error) {
+	cmd := &RedisCommand{}
+	pos := 0
+
+	crlfPos := bytes.Index(payload[pos:], []byte("\r\n"))
+	if crlfPos < 0 {
+		return nil, 0, fmt.Errorf("invalid RESP format")
+	}
+
+	numArgs, err := strconv.Atoi(string(payload[pos+1 : pos+crlfPos]))
+	if err != nil || numArgs <= 0 {
+		return nil, 0, fmt.Errorf("invalid RESP array length")
+	}
+
+	pos += crlfPos + 2
+
+	args := make([]string, 0, numArgs)
+
+	for i := 0; i < numArgs && pos < len(payload); i++ {
+		if payload[pos] != '$' {
+			break
 		}
-	} else {
-		parts := strings.Fields(payloadStr)
-		if len(parts) > 0 {
-			cmd.Command = strings.ToUpper(parts[0])
-			if len(parts) > 1 {
-				cmd.Key = parts[1]
-			}
-			if len(parts) > 2 {
-				cmd.Args = parts[2:]
+
+		crlfPos = bytes.Index(payload[pos:], []byte("\r\n"))
+		if crlfPos < 0 {
+			break
+		}
+
+		argLen, err := strconv.Atoi(string(payload[pos+1 : pos+crlfPos]))
+		if err != nil || argLen < 0 {
+			break
+		}
+
+		pos += crlfPos + 2
+
+		if pos+argLen > len(payload) {
+			break
+		}
+
+		args = append(args, string(payload[pos:pos+argLen]))
+		pos += argLen + 2
+	}
+
+	if len(args) > 0 {
+		cmd.Command = strings.ToUpper(args[0])
+		if len(args) > 1 {
+			cmd.Key = args[1]
+		}
+		if len(args) > 2 {
+			cmd.Args = args[2:]
+		}
+	}
+
+	return cmd, pos, nil
+}
+
+func (p *RedisParser) parseRESPResponse(payload []byte) (*RedisCommand, int, error) {
+	cmd := &RedisCommand{IsResponse: true}
+	pos := 0
+
+	crlfPos := bytes.Index(payload[pos:], []byte("\r\n"))
+	if crlfPos < 0 {
+		crlfPos = len(payload)
+	}
+
+	cmd.Command = string(payload[0])
+	if crlfPos > 1 {
+		cmd.Key = string(payload[1:pos+crlfPos])
+	}
+
+	pos += crlfPos + 2
+
+	if payload[0] == '$' && cmd.Key != "-1" {
+		bulkLen, err := strconv.Atoi(cmd.Key)
+		if err == nil && bulkLen > 0 {
+			if pos+bulkLen <= len(payload) {
+				cmd.Args = []string{string(payload[pos : pos+bulkLen])}
+				pos += bulkLen + 2
 			}
 		}
 	}
 
-	span.TraceID = extractTraceIDFromRedis(payload)
+	return cmd, pos, nil
+}
 
-	return cmd, nil
+func (p *RedisParser) parseInlineCommand(payload []byte) (*RedisCommand, int, error) {
+	cmd := &RedisCommand{}
+
+	newlinePos := bytes.IndexByte(payload, '\n')
+	if newlinePos < 0 {
+		newlinePos = len(payload)
+	}
+
+	line := strings.TrimSpace(string(payload[:newlinePos]))
+	parts := strings.Fields(line)
+
+	if len(parts) > 0 {
+		cmd.Command = strings.ToUpper(parts[0])
+		if len(parts) > 1 {
+			cmd.Key = parts[1]
+		}
+		if len(parts) > 2 {
+			cmd.Args = parts[2:]
+		}
+	}
+
+	pos := newlinePos
+	if pos < len(payload) && payload[pos] == '\n' {
+		pos++
+	}
+	if pos > 0 && payload[pos-1] == '\r' {
+	}
+
+	return cmd, pos, nil
 }
 
 func extractTraceIDFromRedis(payload []byte) string {

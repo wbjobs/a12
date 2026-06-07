@@ -81,27 +81,35 @@ type RawTraceEvent struct {
 }
 
 type Span struct {
-	TraceID      string    `json:"traceId"`
-	SpanID       string    `json:"spanId"`
-	ParentSpanID string    `json:"parentSpanId"`
-	ServiceName  string    `json:"serviceName"`
-	Operation    string    `json:"operation"`
-	Protocol     string    `json:"protocol"`
-	EventType    string    `json:"eventType"`
-	StartTime    time.Time `json:"startTime"`
-	EndTime      time.Time `json:"endTime"`
-	DurationMs   float64   `json:"durationMs"`
-	ErrorCode    int32     `json:"errorCode"`
-	PayloadSize  uint32    `json:"payloadSize"`
-	Payload      string    `json:"payload,omitempty"`
-	SourceIP     string    `json:"sourceIp"`
-	DestIP       string    `json:"destIp"`
-	SourcePort   uint16    `json:"sourcePort"`
-	DestPort     uint16    `json:"destPort"`
-	PID          uint32    `json:"pid"`
-	Comm         string    `json:"comm"`
-	Path         string    `json:"path,omitempty"`
-	Children     []*Span   `json:"children,omitempty"`
+	TraceID      string                 `json:"traceId"`
+	SpanID       string                 `json:"spanId"`
+	ParentSpanID string                 `json:"parentSpanId"`
+	ServiceName  string                 `json:"serviceName"`
+	Operation    string                 `json:"operation"`
+	Protocol     string                 `json:"protocol"`
+	EventType    string                 `json:"eventType"`
+	StartTime    time.Time              `json:"startTime"`
+	EndTime      time.Time              `json:"endTime"`
+	DurationMs   float64                `json:"durationMs"`
+	ErrorCode    int32                  `json:"errorCode"`
+	PayloadSize  uint32                 `json:"payloadSize"`
+	Payload      string                 `json:"payload,omitempty"`
+	SourceIP     string                 `json:"sourceIp"`
+	DestIP       string                 `json:"destIp"`
+	SourcePort   uint16                 `json:"sourcePort"`
+	DestPort     uint16                 `json:"destPort"`
+	PID          uint32                 `json:"pid"`
+	Comm         string                 `json:"comm"`
+	Path         string                 `json:"path,omitempty"`
+	Children     []*Span                `json:"children,omitempty"`
+	Tags         map[string]interface{} `json:"tags,omitempty"`
+}
+
+func (s *Span) SetTag(key string, value interface{}) {
+	if s.Tags == nil {
+		s.Tags = make(map[string]interface{})
+	}
+	s.Tags[key] = value
 }
 
 type Trace struct {
